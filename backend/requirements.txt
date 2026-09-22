@@ -3,8 +3,8 @@ uvicorn
 pandas
 pymongo
 langchain-community
-langchain-huggingface
-sentence-transformers
+langchain-core
 faiss-cpu
 langchain-groq
+huggingface_hub
 python-dotenv

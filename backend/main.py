@@ -1,48 +1,45 @@
 import os
 import re
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
+from dotenv import load_dotenv
 from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-
-from langchain_huggingface import HuggingFaceEmbeddings
+from pymongo import MongoClient
+from langchain_core.embeddings import Embeddings
 from langchain_community.vectorstores import FAISS
-
-try:
-    from pymongo import MongoClient
-except ImportError:
-    MongoClient = None
-
-try:
-    from langchain_groq import ChatGroq
-except ImportError:
-    ChatGroq = None
+from langchain_groq import ChatGroq
+from huggingface_hub import InferenceClient
 
 
 # ============================================================
-# PATHS
+# PATHS / ENVIRONMENT
 # ============================================================
 
 BASE_DIR = Path(__file__).resolve().parent
 
+# Local development: load .env from project root
+# Render: environment variables are provided directly by Render
+load_dotenv(BASE_DIR.parent / ".env")
+load_dotenv(BASE_DIR / ".env")
+
 DATASET_PATH = BASE_DIR / "resolveAI_customer_support_dataset_v2.csv"
 FAISS_PATH = BASE_DIR / "faiss_index"
 
-
-# ============================================================
-# CONFIG
-# ============================================================
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+HF_TOKEN = os.getenv("HF_TOKEN")
 
 MONGODB_URI = os.getenv(
     "MONGODB_URI",
     "mongodb://127.0.0.1:27017"
 )
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+# IMPORTANT:
+# This is the same model that was used to create the
+# existing FAISS index.
+HF_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
 
 # ============================================================
@@ -51,39 +48,24 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 app = FastAPI(
     title="ResolveAI API",
-    description="Autonomous Customer Support & Resolution Agent",
+    description="Autonomous AI Customer Support Backend",
     version="1.0.0"
 )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 
 # ============================================================
-# DATASET
+# LOAD DATASET
 # ============================================================
-
-if not DATASET_PATH.exists():
-    raise FileNotFoundError(
-        f"Dataset not found: {DATASET_PATH}"
-    )
 
 df = pd.read_csv(DATASET_PATH)
 
-ID_COLUMNS = [
+for column in [
     "ticket_id",
     "customer_id",
     "order_id",
     "payment_id",
     "refund_id"
-]
-
-for column in ID_COLUMNS:
+]:
     if column in df.columns:
         df[column] = (
             df[column]
@@ -94,53 +76,180 @@ for column in ID_COLUMNS:
 
 
 # ============================================================
-# FAISS
-# ============================================================
-
-embeddings = HuggingFaceEmbeddings(
-    model_name="sentence-transformers/all-MiniLM-L6-v2"
-)
-
-vectorstore = None
-
-if FAISS_PATH.exists():
-    vectorstore = FAISS.load_local(
-        str(FAISS_PATH),
-        embeddings,
-        allow_dangerous_deserialization=True
-    )
-
-
-# ============================================================
 # MONGODB
 # ============================================================
 
+client = None
+db = None
 cases_collection = None
 
-if MongoClient is not None:
-    try:
-        mongo_client = MongoClient(
-            MONGODB_URI,
-            serverSelectionTimeoutMS=2000
+try:
+    client = MongoClient(
+        MONGODB_URI,
+        serverSelectionTimeoutMS=3000
+    )
+
+    db = client["resolveai"]
+    cases_collection = db["cases"]
+
+except Exception as e:
+
+    print(f"MongoDB initialization failed: {e}")
+
+    client = None
+    db = None
+    cases_collection = None
+
+
+# ============================================================
+# HUGGING FACE API EMBEDDINGS
+# ============================================================
+
+class HuggingFaceAPIEmbeddings(Embeddings):
+
+    def __init__(
+        self,
+        api_key: str,
+        model: str
+    ):
+        self.client = InferenceClient(
+            provider="hf-inference",
+            api_key=api_key
         )
 
-        mongo_client.admin.command("ping")
+        self.model = model
 
-        db = mongo_client["resolveai"]
-        cases_collection = db["cases"]
+    @staticmethod
+    def _to_list(value):
 
-    except Exception:
-        cases_collection = None
+        if hasattr(value, "tolist"):
+            return value.tolist()
+
+        return value
+
+    def embed_query(
+        self,
+        text: str
+    ) -> List[float]:
+
+        embedding = self.client.feature_extraction(
+            text,
+            model=self.model
+        )
+
+        embedding = self._to_list(embedding)
+
+        if (
+            embedding
+            and isinstance(embedding[0], list)
+        ):
+            embedding = embedding[0]
+
+        return [
+            float(x)
+            for x in embedding
+        ]
+
+    def embed_documents(
+        self,
+        texts: List[str]
+    ) -> List[List[float]]:
+
+        results = []
+
+        for text in texts:
+
+            embedding = self.client.feature_extraction(
+                text,
+                model=self.model
+            )
+
+            embedding = self._to_list(embedding)
+
+            if (
+                embedding
+                and isinstance(embedding[0], list)
+            ):
+                embedding = embedding[0]
+
+            results.append([
+                float(x)
+                for x in embedding
+            ])
+
+        return results
 
 
 # ============================================================
-# REQUEST MODEL
+# LOAD FAISS
 # ============================================================
 
-class ChatRequest(BaseModel):
-    message: str
-    customer_id: Optional[str] = None
-    ticket_id: Optional[str] = None
+vectorstore = None
+
+if FAISS_PATH.exists() and HF_TOKEN:
+
+    try:
+
+        embeddings = HuggingFaceAPIEmbeddings(
+            api_key=HF_TOKEN,
+            model=HF_EMBEDDING_MODEL
+        )
+
+        vectorstore = FAISS.load_local(
+            str(FAISS_PATH),
+            embeddings,
+            allow_dangerous_deserialization=True
+        )
+
+        print("FAISS index loaded successfully.")
+
+    except Exception as e:
+
+        print(
+            f"FAISS initialization failed: {e}"
+        )
+
+        vectorstore = None
+
+else:
+
+    if not HF_TOKEN:
+        print(
+            "HF_TOKEN not found. "
+            "FAISS vector search is disabled."
+        )
+
+    if not FAISS_PATH.exists():
+        print(
+            "FAISS index directory not found."
+        )
+
+
+# ============================================================
+# GROQ
+# ============================================================
+
+llm = None
+
+if GROQ_API_KEY:
+
+    try:
+
+        llm = ChatGroq(
+            model="openai/gpt-oss-120b",
+            temperature=0,
+            api_key=GROQ_API_KEY
+        )
+
+        print("Groq LLM initialized.")
+
+    except Exception as e:
+
+        print(
+            f"Groq initialization failed: {e}"
+        )
+
+        llm = None
 
 
 # ============================================================
@@ -148,18 +257,32 @@ class ChatRequest(BaseModel):
 # ============================================================
 
 ID_PATTERNS = {
-    "ticket_id": r"\bT\d+\b",
-    "customer_id": r"\bC\d+\b",
-    "order_id": r"\bORD[-]?\d+\b",
-    "payment_id": r"\bPAY[-]?\d+\b",
-    "refund_id": r"\bREF[-]?\d+\b",
+
+    "ticket_id":
+        r"\bT\d+\b",
+
+    "customer_id":
+        r"\bC\d+\b",
+
+    "order_id":
+        r"\bORD[-]?\d+\b",
+
+    "payment_id":
+        r"\bPAY[-]?\d+\b",
+
+    "refund_id":
+        r"\bREF[-]?\d+\b"
 }
 
 
-def extract_ids(text: str):
-    result = {}
+def extract_ids(
+    text: str
+) -> Dict[str, List[str]]:
 
-    for key, pattern in ID_PATTERNS.items():
+    found_ids = {}
+
+    for id_type, pattern in ID_PATTERNS.items():
+
         matches = re.findall(
             pattern,
             text,
@@ -167,166 +290,290 @@ def extract_ids(text: str):
         )
 
         if matches:
-            result[key] = matches[0].upper()
 
-    return result
+            found_ids[id_type] = [
+                match.upper()
+                for match in matches
+            ]
+
+    return found_ids
 
 
 # ============================================================
-# STRUCTURED LOOKUP
+# STRUCTURED LOOKUPS
 # ============================================================
 
-def find_case(
-    ticket_id=None,
-    order_id=None,
-    customer_id=None
+def find_by_id(
+    id_type: str,
+    id_value: Optional[str]
 ):
 
-    if ticket_id and "ticket_id" in df.columns:
-        result = df[df["ticket_id"] == ticket_id.upper()]
-
-        if not result.empty:
-            return result.iloc[0].to_dict()
-
-    if order_id and "order_id" in df.columns:
-        result = df[df["order_id"] == order_id.upper()]
-
-        if not result.empty:
-            return result.iloc[0].to_dict()
-
-    if customer_id and "customer_id" in df.columns:
-        result = df[df["customer_id"] == customer_id.upper()]
-
-        if not result.empty:
-            return result.iloc[0].to_dict()
-
-    return {}
-
-
-def get_customer_history(customer_id):
-
-    if not customer_id:
-        return []
-
-    if "customer_id" not in df.columns:
-        return []
+    if (
+        not id_value
+        or id_type not in df.columns
+    ):
+        return None
 
     result = df[
-        df["customer_id"] == customer_id.upper()
+        df[id_type]
+        == str(id_value)
+        .upper()
+        .strip()
     ]
 
-    return result.to_dict(orient="records")
+    if result.empty:
+        return None
+
+    return result.iloc[0]
+
+
+def get_customer_history(
+    customer_id: Optional[str]
+):
+
+    if not customer_id:
+        return None
+
+    history = df[
+        df["customer_id"]
+        == customer_id.upper().strip()
+    ]
+
+    if history.empty:
+        return None
+
+    if "timestamp" in history.columns:
+
+        return history.sort_values(
+            "timestamp"
+        )
+
+    return history
 
 
 # ============================================================
-# VECTOR RETRIEVAL
+# ORGANIZATIONAL MEMORY / RAG
 # ============================================================
 
-def retrieve_similar_cases(query, k=5):
+def retrieve_organizational_memory(
+    query: str,
+    k: int = 5
+) -> List[Dict[str, Any]]:
 
     if vectorstore is None:
         return []
 
-    docs = vectorstore.similarity_search(
-        query,
-        k=k
-    )
+    try:
 
-    results = []
+        docs = vectorstore.similarity_search(
+            query,
+            k=k,
+            fetch_k=50
+        )
 
-    for doc in docs:
-        results.append({
-            "ticket_id": doc.metadata.get("ticket_id"),
-            "customer_id": doc.metadata.get("customer_id"),
-            "category": doc.metadata.get("complaint_category"),
-            "subcategory": doc.metadata.get("sub_category"),
-            "resolution_status": doc.metadata.get("resolution_status"),
-            "content": doc.page_content
-        })
+        results = []
 
-    return results
+        for doc in docs:
+
+            results.append({
+
+                "ticket_id":
+                    doc.metadata.get(
+                        "ticket_id"
+                    ),
+
+                "customer_id":
+                    doc.metadata.get(
+                        "customer_id"
+                    ),
+
+                "complaint_category":
+                    doc.metadata.get(
+                        "complaint_category"
+                    ),
+
+                "sub_category":
+                    doc.metadata.get(
+                        "sub_category"
+                    ),
+
+                "resolution_status":
+                    doc.metadata.get(
+                        "resolution_status"
+                    ),
+
+                "content":
+                    doc.page_content
+            })
+
+        return results
+
+    except Exception as e:
+
+        print(
+            f"RAG retrieval failed: {e}"
+        )
+
+        return []
 
 
 # ============================================================
-# RELEVANT TEAM ASSIGNMENT
+# TEAM ASSIGNMENT
 # ============================================================
 
-TEAM_ROUTING = {
-    "payment": {
-        "team": "Payments & Billing",
+TEAM_ASSIGNMENTS = {
+
+    "Payments & Billing": {
         "person": "Aarav Sharma",
         "email": "payments.support@resolveai.demo",
         "phone": "+91 98765 43021"
     },
-    "refund": {
-        "team": "Payments & Billing",
-        "person": "Aarav Sharma",
-        "email": "payments.support@resolveai.demo",
-        "phone": "+91 98765 43021"
-    },
-    "billing": {
-        "team": "Payments & Billing",
-        "person": "Aarav Sharma",
-        "email": "payments.support@resolveai.demo",
-        "phone": "+91 98765 43021"
-    },
-    "order": {
-        "team": "Order Operations",
+
+    "Order Operations": {
         "person": "Riya Mehta",
         "email": "orders.support@resolveai.demo",
         "phone": "+91 98765 43022"
     },
-    "delivery": {
-        "team": "Logistics & Delivery",
+
+    "Logistics & Delivery": {
         "person": "Kabir Singh",
         "email": "logistics.support@resolveai.demo",
         "phone": "+91 98765 43023"
     },
-    "router": {
-        "team": "Technical Support",
+
+    "Technical Support": {
         "person": "Neha Verma",
         "email": "technical.support@resolveai.demo",
         "phone": "+91 98765 43024"
     },
-    "technical": {
-        "team": "Technical Support",
-        "person": "Neha Verma",
-        "email": "technical.support@resolveai.demo",
-        "phone": "+91 98765 43024"
-    },
-    "account": {
-        "team": "Account & Security",
+
+    "Account & Security": {
         "person": "Arjun Kapoor",
         "email": "account.support@resolveai.demo",
         "phone": "+91 98765 43025"
     },
-    "subscription": {
-        "team": "Subscriptions & Plans",
+
+    "Subscriptions & Plans": {
         "person": "Meera Joshi",
         "email": "plans.support@resolveai.demo",
         "phone": "+91 98765 43026"
     },
-}
 
-
-def assign_team(message, case):
-
-    text = " ".join([
-        message,
-        str(case.get("complaint_category", "")),
-        str(case.get("sub_category", "")),
-        str(case.get("root_cause", "")),
-    ]).lower()
-
-    for keyword, assignment in TEAM_ROUTING.items():
-        if keyword in text:
-            return assignment
-
-    return {
-        "team": "Customer Support",
+    "Customer Support": {
         "person": "Priya Nair",
         "email": "support@resolveai.demo",
         "phone": "+91 98765 43020"
+    }
+}
+
+
+def assign_team(
+    case: Dict[str, Any],
+    query: str
+):
+
+    text = (
+        f"{query} "
+        f"{case.get('complaint_category', '')} "
+        f"{case.get('sub_category', '')}"
+    ).lower()
+
+    if any(
+        word in text
+        for word in [
+            "payment",
+            "refund",
+            "billing",
+            "charged",
+            "card",
+            "transaction"
+        ]
+    ):
+
+        team = "Payments & Billing"
+
+    elif any(
+        word in text
+        for word in [
+            "order",
+            "cancelled",
+            "cancel",
+            "purchase"
+        ]
+    ):
+
+        team = "Order Operations"
+
+    elif any(
+        word in text
+        for word in [
+            "delivery",
+            "shipping",
+            "shipment",
+            "courier"
+        ]
+    ):
+
+        team = "Logistics & Delivery"
+
+    elif any(
+        word in text
+        for word in [
+            "router",
+            "device",
+            "technical",
+            "crash",
+            "restart"
+        ]
+    ):
+
+        team = "Technical Support"
+
+    elif any(
+        word in text
+        for word in [
+            "account",
+            "password",
+            "login",
+            "security",
+            "suspicious",
+            "unauthorized"
+        ]
+    ):
+
+        team = "Account & Security"
+
+    elif any(
+        word in text
+        for word in [
+            "subscription",
+            "plan",
+            "upgrade",
+            "downgrade"
+        ]
+    ):
+
+        team = "Subscriptions & Plans"
+
+    else:
+
+        team = "Customer Support"
+
+    assignment = TEAM_ASSIGNMENTS[team]
+
+    return {
+
+        "assigned_team":
+            team,
+
+        "assigned_person":
+            assignment["person"],
+
+        "assigned_email":
+            assignment["email"],
+
+        "assigned_phone":
+            assignment["phone"]
     }
 
 
@@ -334,219 +581,223 @@ def assign_team(message, case):
 # ACTION ENGINE
 # ============================================================
 
-def determine_action(message, case):
-
-    text = message.lower()
+def determine_action(
+    case: Dict[str, Any],
+    query: str
+):
 
     refund_status = str(
-        case.get("refund_status", "")
+        case.get(
+            "refund_status",
+            ""
+        )
+    ).upper()
+
+    refund_requested = case.get(
+        "refund_requested",
+        False
+    )
+
+    order_status = str(
+        case.get(
+            "order_status",
+            ""
+        )
+    ).upper()
+
+    payment_status = str(
+        case.get(
+            "payment_status",
+            ""
+        )
     ).upper()
 
     if refund_status == "COMPLETED":
+
         return {
-            "type": "REQUEST_FEEDBACK",
-            "message": (
-                "Your refund has already been completed. "
-                "Please confirm whether you need any further assistance."
-            )
+
+            "action":
+                "REQUEST_FEEDBACK",
+
+            "reason":
+                "Refund has already been completed. "
+                "No duplicate refund should be created. "
+                "Customer confirmation is required."
         }
 
-    if any(word in text for word in [
-        "refund",
-        "money back",
-        "refund me",
-        "want my money"
-    ]):
+    if refund_requested:
+
         return {
-            "type": "REFUND_APPROVAL",
-            "message": (
-                "I have investigated your request. "
-                "A refund approval request has been initiated. "
-                "A human support specialist must approve the refund "
-                "before it can be processed."
-            )
+
+            "action":
+                "REFUND_REVIEW",
+
+            "reason":
+                "Customer has requested a refund. "
+                "The case should proceed through refund approval."
         }
 
-    if any(word in text for word in [
-        "payment",
-        "charged",
-        "declined",
-        "transaction",
-        "billing"
-    ]):
+    if order_status == "CANCELLED":
+
         return {
-            "type": "PAYMENT_INVESTIGATION",
-            "message": (
-                "I have investigated the payment-related issue "
-                "using the available case and historical support data."
-            )
+
+            "action":
+                "ORDER_INVESTIGATION",
+
+            "reason":
+                "The order is cancelled and requires "
+                "investigation of the order/payment state."
         }
 
-    if any(word in text for word in [
-        "order",
-        "cancelled",
-        "order status"
-    ]):
+    if payment_status == "FAILED":
+
         return {
-            "type": "ORDER_INVESTIGATION",
-            "message": (
-                "I have checked the order information and "
-                "related historical cases."
-            )
+
+            "action":
+                "PAYMENT_INVESTIGATION",
+
+            "reason":
+                "The payment is marked failed and requires "
+                "payment investigation."
         }
 
     return {
-        "type": "INVESTIGATE",
-        "message": (
-            "I have investigated your issue against the available "
-            "customer-support knowledge base."
-        )
+
+        "action":
+            "CUSTOMER_ASSISTANCE",
+
+        "reason":
+            "No specific transactional action is required "
+            "from the available structured data."
     }
 
 
 # ============================================================
-# RESPONSE
+# GROQ RESPONSE
 # ============================================================
 
 def generate_response(
-    message,
-    case,
-    history,
-    similar_cases,
-    assignment,
-    action
-):
+    query: str,
+    current_case: Dict[str, Any],
+    customer_history: List[Dict[str, Any]],
+    similar_cases: List[Dict[str, Any]],
+    action: Dict[str, Any]
+) -> str:
 
-    if ChatGroq is not None and GROQ_API_KEY:
-
-        try:
-            llm = ChatGroq(
-                model="openai/gpt-oss-120b",
-                temperature=0
-            )
-
-            prompt = f"""
-You are ResolveAI, an autonomous customer support agent.
-
-Customer message:
-{message}
-
-Current case:
-{case}
-
-Customer history:
-{history[:5]}
-
-Similar historical cases:
-{similar_cases[:3]}
-
-Action:
-{action}
-
-Assigned specialist:
-{assignment}
-
-Answer naturally and clearly.
-
-Rules:
-- Use only available evidence.
-- Do not invent transaction facts.
-- Explain relevant investigation findings.
-- If a refund requires approval, say that it is awaiting human approval.
-- Never claim a real refund was processed unless the case data says so.
-- Mention the relevant team/person when useful.
-- This is a prototype, so operational actions are simulated.
-"""
-
-            result = llm.invoke(prompt)
-
-            return result.content
-
-        except Exception:
-            pass
-
-    response = action["message"]
-
-    if case.get("root_cause"):
-        response += (
-            f"\n\n**Investigation finding:** "
-            f"{case['root_cause']}."
-        )
-
-    if case.get("resolution_text"):
-        response += (
-            f"\n\n**Historical resolution context:** "
-            f"{case['resolution_text']}"
-        )
-
-    response += (
-        f"\n\n**Assigned team:** {assignment['team']}"
-        f"\n**Assigned specialist:** {assignment['person']}"
-        f"\n**Contact:** {assignment['email']} | {assignment['phone']}"
+    fallback = (
+        f"I investigated your request. "
+        f"{action['reason']} "
+        f"Based on the available case information, "
+        f"the next step is {action['action']}."
     )
 
-    return response
+    if llm is None:
+        return fallback
+
+    try:
+
+        prompt = f"""
+You are ResolveAI, an autonomous customer support agent.
+
+Answer the customer's request using only the supplied evidence.
+Do not invent transaction details, refunds, approvals, or actions.
+
+Customer request:
+{query}
+
+Current case:
+{current_case}
+
+Customer history:
+{customer_history[:10]}
+
+Similar resolved organizational cases:
+{similar_cases[:5]}
+
+System action decision:
+{action}
+
+Give a concise, professional response.
+Explain what was found and what the next step is.
+If a refund is already completed, explicitly say that a
+duplicate refund will not be created.
+"""
+
+        response = llm.invoke(prompt)
+
+        return response.content
+
+    except Exception as e:
+
+        print(
+            f"Groq response generation failed: {e}"
+        )
+
+        return fallback
 
 
 # ============================================================
-# SAVE CASE TO MONGODB
+# MONGODB CASE STORAGE
 # ============================================================
 
 def save_case(
-    message,
-    ids,
-    case,
-    assignment,
-    action,
-    similar_cases,
-    response
+    case_document: Dict[str, Any]
 ):
 
     if cases_collection is None:
-        return
+        return False
 
-    ticket_id = (
-        ids.get("ticket_id")
-        or case.get("ticket_id")
-        or f"CHAT-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
-    )
+    try:
 
-    status = (
-        "PENDING_APPROVAL"
-        if action["type"] == "REFUND_APPROVAL"
-        else "OPEN"
-    )
+        ticket_id = case_document.get(
+            "ticket_id"
+        )
 
-    document = {
-        "ticket_id": ticket_id,
-        "customer_id": ids.get(
-            "customer_id",
-            case.get("customer_id")
-        ),
-        "issue": message,
-        "status": status,
-        "current_case": case,
-        "assignment": assignment,
-        "action": action,
-        "similar_cases_count": len(similar_cases),
-        "response": response,
-        "updated_at": datetime.now(timezone.utc)
-    }
+        if ticket_id:
 
-    cases_collection.update_one(
-        {"ticket_id": ticket_id},
-        {
-            "$set": document,
-            "$push": {
-                "timeline": {
-                    "event": "AI_SUPPORT_RESPONSE",
-                    "message": message,
-                    "timestamp": datetime.now(timezone.utc)
-                }
-            }
-        },
-        upsert=True
-    )
+            cases_collection.update_one(
+
+                {
+                    "ticket_id":
+                        ticket_id
+                },
+
+                {
+                    "$set":
+                        case_document
+                },
+
+                upsert=True
+            )
+
+        else:
+
+            cases_collection.insert_one(
+                case_document
+            )
+
+        return True
+
+    except Exception as e:
+
+        print(
+            f"MongoDB save failed: {e}"
+        )
+
+        return False
+
+
+# ============================================================
+# REQUEST MODEL
+# ============================================================
+
+class ChatRequest(BaseModel):
+
+    message: str
+
+    customer_id: Optional[str] = None
+
+    ticket_id: Optional[str] = None
 
 
 # ============================================================
@@ -555,91 +806,240 @@ def save_case(
 
 @app.get("/")
 def root():
+
     return {
-        "service": "ResolveAI",
-        "status": "running"
+
+        "service":
+            "ResolveAI",
+
+        "status":
+            "running"
     }
 
 
 @app.get("/health")
 def health():
+
     return {
-        "status": "healthy",
-        "vector_db": vectorstore is not None,
-        "mongodb": cases_collection is not None,
-        "llm": ChatGroq is not None and bool(GROQ_API_KEY)
+
+        "status":
+            "healthy",
+
+        "vector_db":
+            vectorstore is not None,
+
+        "mongodb":
+            cases_collection is not None,
+
+        "llm":
+            llm is not None,
+
+        "hf_embeddings":
+            bool(HF_TOKEN)
     }
 
 
 @app.post("/chat")
-def chat(request: ChatRequest):
+def chat(
+    request: ChatRequest
+):
 
-    message = request.message.strip()
+    query = request.message
 
-    ids = extract_ids(message)
+    ids = extract_ids(query)
 
     customer_id = (
         request.customer_id
-        or ids.get("customer_id")
+        or ids.get(
+            "customer_id",
+            [None]
+        )[0]
     )
 
     ticket_id = (
         request.ticket_id
-        or ids.get("ticket_id")
+        or ids.get(
+            "ticket_id",
+            [None]
+        )[0]
     )
 
-    order_id = ids.get("order_id")
+    order_id = ids.get(
+        "order_id",
+        [None]
+    )[0]
 
-    case = find_case(
-        ticket_id=ticket_id,
-        order_id=order_id,
-        customer_id=customer_id
+
+    # --------------------------------------------------------
+    # CUSTOMER HISTORY
+    # --------------------------------------------------------
+
+    customer_history = []
+
+    if customer_id:
+
+        history = get_customer_history(
+            customer_id
+        )
+
+        if history is not None:
+
+            customer_history = (
+                history
+                .to_dict(
+                    orient="records"
+                )
+            )
+
+
+    # --------------------------------------------------------
+    # CURRENT CASE
+    # --------------------------------------------------------
+
+    current_case = {}
+
+    if ticket_id:
+
+        result = find_by_id(
+            "ticket_id",
+            ticket_id
+        )
+
+        if result is not None:
+
+            current_case = (
+                result.to_dict()
+            )
+
+    elif order_id:
+
+        result = find_by_id(
+            "order_id",
+            order_id
+        )
+
+        if result is not None:
+
+            current_case = (
+                result.to_dict()
+            )
+
+
+    # --------------------------------------------------------
+    # RAG
+    # --------------------------------------------------------
+
+    similar_cases = (
+        retrieve_organizational_memory(
+            query,
+            k=5
+        )
     )
 
-    history = get_customer_history(customer_id)
 
-    similar_cases = retrieve_similar_cases(
-        message,
-        k=5
-    )
-
-    assignment = assign_team(
-        message,
-        case
-    )
+    # --------------------------------------------------------
+    # ACTION
+    # --------------------------------------------------------
 
     action = determine_action(
-        message,
-        case
+        current_case,
+        query
     )
 
-    response = generate_response(
-        message=message,
-        case=case,
-        history=history,
+
+    # --------------------------------------------------------
+    # TEAM ASSIGNMENT
+    # --------------------------------------------------------
+
+    assignment = assign_team(
+        current_case,
+        query
+    )
+
+
+    # --------------------------------------------------------
+    # AI RESPONSE
+    # --------------------------------------------------------
+
+    response_text = generate_response(
+
+        query=query,
+
+        current_case=current_case,
+
+        customer_history=customer_history,
+
         similar_cases=similar_cases,
-        assignment=assignment,
+
         action=action
     )
 
+
+    # --------------------------------------------------------
+    # SAVE CASE
+    # --------------------------------------------------------
+
+    case_document = {
+
+        "ticket_id":
+            ticket_id,
+
+        "customer_id":
+            customer_id,
+
+        "issue":
+            query,
+
+        "current_case":
+            current_case,
+
+        "status":
+            "WAITING_FOR_CUSTOMER",
+
+        "action":
+            action,
+
+        "assignment":
+            assignment,
+
+        "customer_feedback": {
+
+            "status":
+                None,
+
+            "message":
+                None
+        }
+    }
+
     save_case(
-        message=message,
-        ids=ids,
-        case=case,
-        assignment=assignment,
-        action=action,
-        similar_cases=similar_cases,
-        response=response
+        case_document
     )
 
+
+    # --------------------------------------------------------
+    # RESPONSE
+    # --------------------------------------------------------
+
     return {
-        "response": response,
-        "action": action["type"],
-        "assigned_team": assignment["team"],
-        "assigned_person": assignment["person"],
-        "assigned_email": assignment["email"],
-        "assigned_phone": assignment["phone"],
-        "similar_cases_count": len(similar_cases),
-        "customer_history_count": len(history),
-        "case_found": bool(case)
+
+        "response":
+            response_text,
+
+        "action":
+            action["action"],
+
+        "action_reason":
+            action["reason"],
+
+        **assignment,
+
+        "similar_cases_count":
+            len(similar_cases),
+
+        "customer_history_count":
+            len(customer_history),
+
+        "case_found":
+            bool(current_case)
     }
